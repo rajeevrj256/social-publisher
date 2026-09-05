@@ -468,3 +468,9 @@ with session_scope() as s:
 | `404 account not found` | typo, or use the numeric id |
 | `409 theme already exists` | it is already registered; nothing to do |
 | `500` after a model change | containers running stale code — `docker compose up -d --build` |
+
+
+
+#shift auth user:
+
+gh auth switch --user rajeevrj256
