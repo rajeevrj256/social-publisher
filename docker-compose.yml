@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # Opt-in only. With DATABASE_URL set (Neon or any managed Postgres) this
+    # service stays down; start it with: docker compose --profile localdb up -d
+    profiles: ["localdb"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-social_publisher}
+      POSTGRES_USER: ${POSTGRES_USER:-publisher}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-publisher}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # Not published to the host by default: the database is only reachable
+    # from the application network.
+    expose:
+      - "5432"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    expose:
+      - "6379"
+
+  migrate:
+    build: .
+    env_file: .env
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  scheduler:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ${HOST_VIDEO_ROOT:-./videos/to_publish}:/videos/to_publish:ro
+    command: ["python", "-m", "src.scheduler"]
+
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      # Read-only: the originals are never modified or deleted.
+      - ${HOST_VIDEO_ROOT:-./videos/to_publish}:/videos/to_publish:ro
+    command: ["python", "-m", "src.worker"]
+
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ${HOST_VIDEO_ROOT:-./videos/to_publish}:/videos/to_publish:ro
+    command: ["python", "-m", "src.telegram_bot"]
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Published to localhost only - the mapping API changes what gets posted.
+    ports:
+      - "127.0.0.1:${ADMIN_API_PORT:-8088}:8088"
+    command: ["python", "-m", "src.api"]
+
+volumes:
+  pgdata:
+  redisdata:

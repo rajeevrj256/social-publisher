@@ -1,0 +1,6 @@
+# Shell scripts must keep LF or they break inside Linux containers on Windows.
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+*.mp4 binary
+*.mov binary
