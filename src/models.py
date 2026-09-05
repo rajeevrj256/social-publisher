@@ -38,6 +38,8 @@ class PublicationStatus(str, enum.Enum):
     awaiting_approval = "awaiting_approval"  # shown on Telegram, waiting on a human
     approved = "approved"        # human said yes; safe to queue
     rejected = "rejected"        # human said no; never publishes
+    deferred = "deferred"        # human said "not today"; returns after
+                                 # available_after passes
     queued = "queued"            # handed to the worker queue
     publishing = "publishing"    # worker owns it; crash recovery looks here
     published = "published"
@@ -289,6 +291,12 @@ class Publication(Base, TimestampMixin):
     idempotency_key: Mapped[str | None] = mapped_column(String(64), unique=True)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     approval_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True))
+    # Set only by a "not today" decision. Until this moment passes the row
+    # blocks the video like any other; after it, selection treats the video as
+    # free again and reserve_publication reuses this same row (the unique
+    # constraint on (video, account, platform) forbids a second one).
+    available_after: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True))
     # Which proposal this is for its slot. A rejection offers a different video
     # and increments this, so the retry budget is per slot, not per video.

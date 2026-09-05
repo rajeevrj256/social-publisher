@@ -55,16 +55,24 @@ def candidate_video_query(account: Account, theme_id: int | None):
     mapping excludes this account. A video with no mapping rows at all is
     governed by theme alone.
     """
-    # ANY existing row excludes the video for this account+platform, whatever
-    # its status. The unique constraint on (video, account, platform) permits
-    # exactly one row, so treating a failed or rejected one as "available
-    # again" only produces an IntegrityError at insert time. Re-attempting a
-    # failure means updating that row (/retry), not creating a second one.
+    # Any existing row excludes the video for this account+platform, whatever
+    # its status -- with one exception. The unique constraint on
+    # (video, account, platform) permits exactly one row, so treating a failed
+    # or rejected one as "available again" only produces an IntegrityError at
+    # insert time. Re-attempting a failure means updating that row (/retry),
+    # not creating a second one.
+    #
+    # The exception is an expired `deferred` row: "not today" is a decision
+    # about this slot, not about the video. Once available_after passes, the
+    # row stops blocking and reserve_publication reuses it in place.
     already = (
         select(Publication.id)
         .where(Publication.video_id == Video.id,
                Publication.account_id == account.id,
-               Publication.platform == account.platform)
+               Publication.platform == account.platform,
+               ~and_(Publication.status == PublicationStatus.deferred,
+                     Publication.available_after.isnot(None),
+                     Publication.available_after <= func.now()))
         .correlate(Video)
     )
 
@@ -172,6 +180,30 @@ def select_next_video(session: Session, account: Account, *,
     return None, "no unpublished videos left for this account's themes"
 
 
+def next_local_midnight(account: Account,
+                        now_utc: datetime | None = None) -> datetime:
+    """Start of the account's next local day, in UTC.
+
+    When a "not today" deferral expires. Measured in the account's own
+    timezone, so "today" means the operator's day, not UTC's: deferring at
+    23:50 IST frees the video ten minutes later, which is the literal reading
+    of "not today" and the one that keeps it in rotation.
+    """
+    from .config import get_settings
+    from datetime import time, timedelta
+    from zoneinfo import ZoneInfo
+
+    now_utc = now_utc or datetime.now(timezone.utc)
+    try:
+        tzinfo = ZoneInfo(account.timezone or get_settings().tz)
+    except Exception:
+        tzinfo = ZoneInfo("UTC")
+    local = now_utc.astimezone(tzinfo)
+    tomorrow = (local + timedelta(days=1)).date()
+    return datetime.combine(tomorrow, time(0, 0), tzinfo=tzinfo).astimezone(
+        timezone.utc)
+
+
 def reserve_publication(session: Session, account: Account, video: Video, *,
                         scheduled_at: datetime | None = None) -> Publication:
     """Create the publication row that claims this video for this account.
@@ -179,7 +211,38 @@ def reserve_publication(session: Session, account: Account, video: Video, *,
     The unique constraint on (video, account, platform) is the real guard: if a
     concurrent scheduler wins the race, the insert fails rather than producing a
     second post of the same clip to the same account.
+
+    That same constraint is why an expired "not today" deferral is revived in
+    place rather than re-inserted: the video became a candidate again, but its
+    old row still occupies the only slot the constraint allows.
     """
+    revived = session.scalar(
+        select(Publication).where(
+            Publication.video_id == video.id,
+            Publication.account_id == account.id,
+            Publication.platform == account.platform,
+            Publication.status == PublicationStatus.deferred,
+        ).with_for_update()
+    )
+    if revived is not None:
+        revived.status = PublicationStatus.pending
+        revived.available_after = None
+        revived.error_message = None
+        revived.approved_by = None
+        revived.approval_requested_at = None
+        revived.approved_at = None
+        # A revived row enters a NEW slot, so it must not carry yesterday's
+        # attempt count in and shrink today's rejection budget.
+        # propose_replacement overwrites this straight after when it is the
+        # caller, so resetting here is safe.
+        revived.proposal_attempt = 1
+        revived.scheduled_at = scheduled_at or datetime.now(timezone.utc)
+        revived.idempotency_key = uuid.uuid4().hex
+        session.flush()
+        log.info("revived deferred publication %s (video %s -> %s)",
+                 revived.id, video.id, account.username)
+        return revived
+
     publication = Publication(
         video_id=video.id,
         account_id=account.id,

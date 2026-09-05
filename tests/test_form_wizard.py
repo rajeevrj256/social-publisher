@@ -118,3 +118,59 @@ def test_edit_pattern_matches_the_button_payload():
     assert edit_payloads, "keyboard emits no edit button"
     for payload in edit_payloads:
         assert pattern.match(payload), f"{payload} would never reach the handler"
+
+
+# ---- callback timing --------------------------------------------------------
+
+def test_callback_is_answered_before_the_work_starts():
+    """Telegram invalidates a callback query after ~15s.
+
+    Deciding can take minutes -- a rejection downloads the replacement video
+    from Drive to build its preview -- so answering last raised
+    "Query is too old and response timeout expired", left the button spinning
+    and taught the operator to press again, which produced a second proposal.
+    """
+    import inspect
+
+    from src import telegram_bot
+
+    # The early-return guard for a malformed payload answers too, and matching
+    # that one would let the real path regress unnoticed. Everything before the
+    # guard's return is therefore discarded first.
+    guard = "await query.answer()\n        return"
+    for handler in (telegram_bot.on_approval_button,
+                    telegram_bot.on_edit_button):
+        source = inspect.getsource(handler)
+        assert guard in source, f"{handler.__name__}: guard shape changed"
+        body = source.split(guard, 1)[1]
+
+        answers = [i for i in range(len(body))
+                   if body.startswith("query.answer(", i)]
+        assert answers, (
+            f"{handler.__name__} never answers the callback on the real path")
+        for slow in ("_decide(", "session_scope(", "_editable(", "to_thread("):
+            if slow in body:
+                assert answers[0] < body.index(slow), (
+                    f"{handler.__name__} reaches {slow} before answering the "
+                    f"callback; Telegram rejects the late answer")
+
+
+def test_blocking_work_runs_off_the_event_loop():
+    """_decide does network I/O. Run inline it freezes every other button."""
+    import inspect
+
+    from src import telegram_bot
+
+    source = inspect.getsource(telegram_bot.on_approval_button)
+    assert "asyncio.to_thread" in source, (
+        "_decide blocks on Drive downloads and Telegram sends; running it in "
+        "the event loop stops the bot answering anything else")
+
+
+def test_an_error_handler_is_registered():
+    """'No error handlers are registered' is how a dead button stays silent."""
+    import inspect
+
+    from src import telegram_bot
+
+    assert "add_error_handler" in inspect.getsource(telegram_bot.main)

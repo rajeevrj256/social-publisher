@@ -157,9 +157,33 @@ def approval_request_message(publication, account, video, theme_name: str) -> st
         f"Scheduled:\n{when}",
         "",
         f"Approve:  /approve {publication.id}",
-        f"Reject:   /reject {publication.id}",
+        f"Reject:   /reject {publication.id}   (permanent)",
+        f"Not today: /defer {publication.id}   (back tomorrow)",
     ]
     return "\n".join(lines)
+
+
+def approval_keyboard(publication_id: int) -> dict:
+    """The three decisions. Reject is permanent; "Not today" frees the video
+    again after midnight in the account's timezone.
+
+    Kept as its own function so the registered callback pattern can be tested
+    against the payloads actually emitted, rather than against a copy of them.
+    """
+    return {"inline_keyboard": [
+        [
+            {"text": "✅ Approve", "callback_data": f"approve:{publication_id}"},
+            {"text": "❌ Reject", "callback_data": f"reject:{publication_id}"},
+        ],
+        # Second row: rejecting is permanent, skipping is not. Separating them
+        # makes the irreversible one harder to hit by accident. Editing lives
+        # here too, so wording can be changed without approving first.
+        [
+            {"text": "🕒 Not today", "callback_data": f"defer:{publication_id}"},
+            {"text": "✍️ Edit details",
+             "callback_data": f"edit:{publication_id}:title"},
+        ],
+    ]}
 
 
 def send_approval_request(publication, account, video, theme_name: str) -> bool:
@@ -171,10 +195,7 @@ def send_approval_request(publication, account, video, theme_name: str) -> bool:
                     publication.id)
         return False
     text = approval_request_message(publication, account, video, theme_name)
-    keyboard = {"inline_keyboard": [[
-        {"text": "✅ Approve", "callback_data": f"approve:{publication.id}"},
-        {"text": "❌ Reject", "callback_data": f"reject:{publication.id}"},
-    ]]}
+    keyboard = approval_keyboard(publication.id)
     with _preview_file(video) as path:
         if path:
             return send_video(path, text, keyboard)
@@ -214,11 +235,19 @@ def metadata_request_message(publication, account, video, theme_name: str,
 
 
 def metadata_keyboard(publication_id: int) -> dict:
+    """The form has the same three outcomes as the approval card.
+
+    "Skip this video" used to be wired to reject, so declining to write a
+    caption burned the video permanently -- an answer to "not right now" that
+    nobody means. Skipping is a deferral; rejecting is spelled out separately.
+    """
     return {"inline_keyboard": [
         [{"text": "✍️ Fill in details",
           "callback_data": f"edit:{publication_id}:title"}],
-        [{"text": "❌ Skip this video",
-          "callback_data": f"reject:{publication_id}"}],
+        [
+            {"text": "🕒 Not today", "callback_data": f"defer:{publication_id}"},
+            {"text": "❌ Reject", "callback_data": f"reject:{publication_id}"},
+        ],
     ]}
 
 

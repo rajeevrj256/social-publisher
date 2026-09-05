@@ -397,9 +397,64 @@ its details and approve there.
 | `/needs` | posts waiting on your wording |
 | `/meta <id>` | set Title / Caption / Tags in one message |
 | `/pending` | posts waiting on your approval |
-| `/approve <id>` · `/reject <id>` | decide |
+| `/approve <id>` · `/reject <id>` · `/defer <id>` | decide |
 | `/status` · `/queue` · `/recent` · `/failed` · `/retry <id>` | operate |
 | `/pause <account>` · `/resume <account>` | control one account |
+
+### The three decisions
+
+Each approval message carries three buttons. They differ in what happens to
+the **video**, not just to the slot:
+
+| Button | Command | Effect on the video |
+| --- | --- | --- |
+| ✅ Approve | `/approve <id>` | uploads now |
+| ❌ Reject | `/reject <id>` | **permanent** — never offered to this account again |
+| 🕒 Not today | `/defer <id>` | back in the pool from midnight, account-local |
+
+Reject is permanent because the unique constraint on
+`(video, account, platform)` allows exactly one publication row per pair, and a
+rejected row keeps occupying it. "Not today" writes `available_after` instead;
+once that passes, selection stops excluding the video and the scheduler revives
+that same row rather than inserting a second one.
+
+Both a reject and a defer immediately propose a different video for the same
+slot, up to `REJECTION_LIMIT` proposals.
+
+The scope is per account. Deferring or rejecting on `yt1` says nothing about
+`ig1` — the same video can still go there tomorrow.
+
+### If you do not answer
+
+An unanswered request is **not** treated as a rejection. At
+`APPROVAL_CUTOFF_HOUR` (default 23:00, account-local) the scheduler defers it
+automatically and tells you so on Telegram. The slot is lost; the video returns
+the next day.
+
+The deadline is recomputed on every 60s tick rather than fired by a cron at
+23:00, so a container that is down at the cutoff still expires the request when
+it comes back up.
+
+To see what would expire and when:
+
+```bash
+docker compose exec -T scheduler python -c "
+from datetime import timezone
+from zoneinfo import ZoneInfo
+from sqlalchemy import select
+from src.db import session_scope
+from src.models import Account, Publication, PublicationStatus
+from src.scheduler import approval_deadline
+with session_scope() as s:
+    for p in s.scalars(select(Publication).where(
+            Publication.status == PublicationStatus.awaiting_approval)):
+        a = s.get(Account, p.account_id)
+        req = p.approval_requested_at or p.scheduled_at or p.created_at
+        if req.tzinfo is None: req = req.replace(tzinfo=timezone.utc)
+        d = approval_deadline(a, req).astimezone(ZoneInfo(a.timezone))
+        print(f'pub {p.id} -> auto-defer at {d:%d %b %H:%M} {a.timezone}')
+"
+```
 
 ---
 

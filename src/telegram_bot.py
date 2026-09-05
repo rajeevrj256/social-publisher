@@ -7,10 +7,12 @@ someone probing it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from functools import wraps
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from telegram import ForceReply, Update
@@ -24,14 +26,15 @@ from .db import session_scope
 from .models import (
     Account, AccountTheme, Platform, Publication, PublicationStatus, Theme, Video,
 )
-from .jobs import prepare_metadata
+from .jobs import prepare_metadata, request_decision
 from .metadata_ai import metadata_complete
 from .notifications import (
     metadata_keyboard, send_approval_request, send_message,
 )
 from .scheduler import due_slots, schedule_account
 from .selection import (
-    pending_count, propose_replacement, reserve_publication, select_next_video,
+    next_local_midnight, pending_count, propose_replacement,
+    reserve_publication, select_next_video,
 )
 
 log = logging.getLogger(__name__)
@@ -275,9 +278,11 @@ async def cmd_theme(update: Update, _ctx) -> None:
 
 
 
-def _decide(session, publication_id: int, approve: bool, actor: str) -> str:
-    """Apply an approval decision. Idempotent: a double tap on the button must
-    not queue the same upload twice."""
+def _decide(session, publication_id: int, decision: str, actor: str) -> str:
+    """Apply an approval decision: "approve", "reject" or "defer".
+
+    Idempotent: a double tap on the button must not queue the same upload twice.
+    """
     publication = session.get(Publication, publication_id)
     if publication is None:
         return f"Publication #{publication_id} not found."
@@ -286,13 +291,23 @@ def _decide(session, publication_id: int, approve: bool, actor: str) -> str:
     if publication.status not in (PublicationStatus.awaiting_approval,
                                   PublicationStatus.awaiting_metadata,
                                   PublicationStatus.rejected,
+                                  PublicationStatus.deferred,
                                   PublicationStatus.approved):
         return (f"#{publication_id} is {publication.status.value}, "
                 f"not waiting for approval.")
 
+    # A rejected or deferred row may still be approved -- changing your mind is
+    # allowed -- but it must not be rejected or deferred *again*: each pass
+    # proposes a replacement, so a double tap produced two new videos for one
+    # slot. Telegram also redelivers a callback when the first answer is slow.
+    if decision in ("reject", "defer") and publication.status in (
+            PublicationStatus.rejected, PublicationStatus.deferred):
+        return (f"#{publication_id} is already {publication.status.value}; "
+                f"a replacement was already offered.")
+
     account = session.get(Account, publication.account_id)
     video = session.get(Video, publication.video_id)
-    if approve:
+    if decision == "approve":
         if publication.status == PublicationStatus.approved:
             return f"#{publication_id} was already approved."
         missing = metadata_complete(publication)
@@ -300,31 +315,49 @@ def _decide(session, publication_id: int, approve: bool, actor: str) -> str:
             return (f"#{publication_id} still needs {', '.join(missing)}. "
                     f"Send /meta {publication_id} first.")
         publication.status = PublicationStatus.queued
+        publication.available_after = None   # approving overrides a deferral
         publication.approved_at = datetime.now(timezone.utc)
         publication.approved_by = actor
         session.flush()
         return (f"✅ Approved #{publication_id}: {video.filename} "
                 f"-> @{account.username}. Uploading now.")
 
-    publication.status = PublicationStatus.rejected
-    publication.approved_by = actor
-    publication.error_message = "rejected on Telegram"
-    session.flush()
+    if decision == "defer":
+        # Not a verdict on the video, only on today. The row stays (the unique
+        # constraint allows just one per video+account+platform) and keeps
+        # blocking until available_after passes, at which point selection lets
+        # the video through again and reserve_publication reuses this row.
+        publication.status = PublicationStatus.deferred
+        publication.available_after = next_local_midnight(account)
+        publication.approved_by = actor
+        publication.error_message = "deferred on Telegram - back tomorrow"
+        session.flush()
+        back = publication.available_after.astimezone(
+            ZoneInfo(account.timezone or get_settings().tz))
+        lines = [f"🕒 Not today #{publication_id}: {video.filename} "
+                 f"-> @{account.username}.",
+                 f"Back in the pool from {back:%d %b %H:%M} "
+                 f"({account.timezone}).",
+                 f"Changed your mind? /approve {publication_id} still works, "
+                 f"or /meta {publication_id} to write the details."]
+    else:
+        publication.status = PublicationStatus.rejected
+        publication.approved_by = actor
+        publication.error_message = "rejected on Telegram"
+        session.flush()
 
-    lines = [f"❌ Rejected #{publication_id}: {video.filename} "
-             f"-> @{account.username}."]
+        lines = [f"❌ Rejected #{publication_id}: {video.filename} "
+                 f"-> @{account.username}."]
     replacement, note = propose_replacement(session, publication)
     lines.append(note)
     if replacement is not None:
-        prepare_metadata(session, replacement)
-        replacement.status = PublicationStatus.awaiting_approval
-        replacement.approval_requested_at = datetime.now(timezone.utc)
-        session.flush()
         next_video = session.get(Video, replacement.video_id)
-        send_approval_request(replacement, account, next_video,
-                              next_video.theme.name if next_video.theme
-                              else "unknown")
-        lines.append(f"Sent a different video for approval: {next_video.filename}")
+        # Shared with the scheduler: a replacement with no caption must arrive
+        # as a form to fill in, not as an approval card with nothing to approve.
+        asked = request_decision(session, replacement, account, next_video)
+        lines.append(
+            f"Sent a different video: {next_video.filename}"
+            + (" - it needs details first." if asked == "metadata" else ""))
     return "\n".join(lines)
 
 
@@ -338,7 +371,7 @@ async def cmd_approve(update: Update, ctx) -> None:
     publication_id = int(ctx.args[0].lstrip("#"))
     actor = str(update.effective_user.id) if update.effective_user else "telegram"
     with session_scope() as session:
-        message = _decide(session, publication_id, True, actor)
+        message = _decide(session, publication_id, "approve", actor)
         queued = session.get(Publication, publication_id)
         should_enqueue = queued is not None and queued.status == PublicationStatus.queued
     if should_enqueue:
@@ -354,7 +387,21 @@ async def cmd_reject(update: Update, ctx) -> None:
         return
     actor = str(update.effective_user.id) if update.effective_user else "telegram"
     with session_scope() as session:
-        message = _decide(session, int(ctx.args[0].lstrip("#")), False, actor)
+        message = _decide(session, int(ctx.args[0].lstrip("#")),
+                          "reject", actor)
+    await update.message.reply_text(message)
+
+
+@restricted
+async def cmd_defer(update: Update, ctx) -> None:
+    """Skip a video for today only. It returns to the pool tomorrow."""
+    if not ctx.args or not ctx.args[0].lstrip("#").isdigit():
+        await update.message.reply_text("Usage: /defer <publication id>")
+        return
+    actor = str(update.effective_user.id) if update.effective_user else "telegram"
+    with session_scope() as session:
+        message = _decide(session, int(ctx.args[0].lstrip("#")),
+                          "defer", actor)
     await update.message.reply_text(message)
 
 
@@ -397,22 +444,38 @@ async def on_approval_button(update: Update, _ctx) -> None:
     publication_id = int(raw_id)
     actor = str(query.from_user.id) if query.from_user else "telegram"
 
-    with session_scope() as session:
-        message = _decide(session, publication_id, action == "approve", actor)
-        publication = session.get(Publication, publication_id)
-        should_enqueue = (publication is not None
-                          and publication.status == PublicationStatus.queued)
-    if should_enqueue:
-        get_queue().enqueue("src.jobs.publish_publication", publication_id,
-                            job_timeout=3600, result_ttl=86400)
-
-    await query.answer("Done")
+    # Answer BEFORE doing the work. Telegram invalidates a callback query after
+    # about 15 seconds, and deciding can take minutes: a rejection proposes a
+    # replacement, which downloads that video from Drive to build the preview.
+    # Answering last raised "Query is too old", left the button spinning, and
+    # taught the operator to press again.
+    await query.answer("Working...")
     try:
-        # Drop the buttons so the decision cannot be re-pressed later.
+        # Drop the buttons immediately so the decision cannot be re-pressed
+        # while the replacement is still being fetched.
         await query.edit_message_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await query.message.reply_text(message)
+
+    def work() -> tuple[str, bool]:
+        with session_scope() as session:
+            text = _decide(session, publication_id, action, actor)
+            publication = session.get(Publication, publication_id)
+            queued = (publication is not None
+                      and publication.status == PublicationStatus.queued)
+        return text, queued
+
+    # _decide is synchronous and does network I/O (Drive downloads, Telegram
+    # sends). Run inline it would block the whole bot event loop, so every
+    # other button -- "Fill in details" included -- stops responding until it
+    # finishes.
+    message, should_enqueue = await asyncio.to_thread(work)
+
+    if should_enqueue:
+        get_queue().enqueue("src.jobs.publish_publication", publication_id,
+                            job_timeout=3600, result_ttl=86400)
+    if message:
+        await query.message.reply_text(message)
 
 
 
@@ -438,7 +501,10 @@ def _after_metadata_change(session, publication) -> str:
         publication.status = PublicationStatus.awaiting_metadata
         return f"Saved. Still missing: {', '.join(missing)}."
 
+    # Writing the wording for a deferred post is itself a change of mind, so
+    # the deferral is lifted rather than leaving a ready post still blocked.
     publication.status = PublicationStatus.awaiting_approval
+    publication.available_after = None
     session.flush()
     send_approval_request(publication, account, video,
                           video.theme.name if video.theme else "unknown")
@@ -602,7 +668,11 @@ async def _ask_for(message, publication, field: str, video) -> None:
     """Open the reply box pre-focused on one field."""
     await message.reply_text(
         _prompt_text(publication, field, video),
-        reply_markup=ForceReply(selective=True,
+        # selective=True targets the sender of the message being replied to --
+        # which here is the bot itself, so Telegram opened the reply box for
+        # nobody and the prompt appeared with no way to answer it. This is a
+        # private chat with one authorised user, so target everyone.
+        reply_markup=ForceReply(selective=False,
                                 input_field_placeholder=FIELD_LABEL[field]),
     )
 
@@ -623,15 +693,23 @@ async def on_edit_button(update: Update, _ctx) -> None:
         await query.answer()
         return
 
-    with session_scope() as session:
-        publication, error = _editable(session, int(raw_id))
-        if error:
-            await query.answer()
-            await query.message.reply_text(error)
-            return
-        video = session.get(Video, publication.video_id)
-        await query.answer()
-        await _ask_for(query.message, publication, field, video)
+    # Answered first for the same reason as the decision buttons: the callback
+    # expires in about 15 seconds and anything slower loses the answer.
+    await query.answer()
+
+    def load():
+        with session_scope() as session:
+            publication, error = _editable(session, int(raw_id))
+            if error:
+                return None, None, error
+            video = session.get(Video, publication.video_id)
+            return publication, video, None
+
+    publication, video, error = await asyncio.to_thread(load)
+    if error:
+        await query.message.reply_text(error)
+        return
+    await _ask_for(query.message, publication, field, video)
 
 
 @restricted
@@ -764,18 +842,33 @@ def main() -> None:
         ("failed", cmd_failed), ("retry", cmd_retry), ("pause", cmd_pause),
         ("resume", cmd_resume), ("publish", cmd_publish), ("theme", cmd_theme),
         ("report", cmd_report), ("approve", cmd_approve), ("reject", cmd_reject),
+        ("defer", cmd_defer),
         ("pending", cmd_pending), ("meta", cmd_meta), ("title", cmd_title),
         ("caption", cmd_caption), ("tags", cmd_tags), ("needs", cmd_needs),
     ]:
         app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_approval_button,
-                                         pattern=r"^(approve|reject):\d+$"))
+                                         pattern=r"^(approve|reject|defer):\d+$"))
     app.add_handler(CallbackQueryHandler(
         on_edit_button, pattern=r"^edit:\d+:(title|caption|hashtags)$"))
     # Replies to the wizard prompts. Registered last and excluding commands so
     # it cannot swallow ordinary /commands the user types as a reply.
     app.add_handler(MessageHandler(
         filters.REPLY & filters.TEXT & ~filters.COMMAND, on_form_reply))
+
+    async def on_error(update, context) -> None:
+        """Without this python-telegram-bot only logs 'No error handlers are
+        registered' and the operator is left staring at a dead button."""
+        log_.exception("handler failed", exc_info=context.error)
+        chat = getattr(getattr(update, "effective_chat", None), "id", None)
+        if chat:
+            try:
+                await context.bot.send_message(
+                    chat, f"⚠️ That action failed: {context.error}")
+            except Exception:
+                pass
+
+    app.add_error_handler(on_error)
 
     log_.info("telegram bot polling")
     app.run_polling(drop_pending_updates=True)

@@ -20,15 +20,16 @@ import uuid
 
 from .models import (
     Account, AccountSchedule, Platform, Publication, PublicationStatus,
-    Schedule, ScheduleAccount, Theme,
+    Schedule, ScheduleAccount, Theme, Video,
 )
-from .jobs import prepare_metadata
+from .jobs import prepare_metadata, request_decision
 from .metadata_ai import metadata_complete
-from .notifications import send_approval_request, send_metadata_request
-from .metadata_ai import metadata_complete
+from .notifications import (
+    send_approval_request, send_message, send_metadata_request,
+)
 from .selection import (
-    coordinated_peers, published_in_window, reserve_publication,
-    select_next_video, video_is_eligible_for,
+    coordinated_peers, next_local_midnight, published_in_window,
+    reserve_publication, select_next_video, video_is_eligible_for,
 )
 
 log = logging.getLogger(__name__)
@@ -162,17 +163,10 @@ def schedule_account(session: Session, account: Account, *,
                                       for p in peers_created)
                     log.info("coordinated group %s covers %s + %s",
                              publication.group_key, account.username, extra)
-                if missing or not authored:
-                    # Nothing real was written for this post. Ask rather than
-                    # publish a filename as a caption.
-                    publication.status = PublicationStatus.awaiting_metadata
-                    session.flush()
-                    send_metadata_request(publication, account, video, theme_name,
-                                          missing or ["caption"])
-                else:
-                    publication.status = PublicationStatus.awaiting_approval
-                    session.flush()
-                    send_approval_request(publication, account, video, theme_name)
+                # Nothing real may have been written for this post; ask
+                # rather than publish a filename as a caption.
+                request_decision(session, publication, account, video,
+                                 theme_name)
                 awaiting.append(publication.id)
 
                 # Each peer gets its OWN metadata and its OWN approval: the
@@ -184,18 +178,7 @@ def schedule_account(session: Session, account: Account, *,
                         mirror.status = PublicationStatus.queued
                         session.flush()
                         continue
-                    peer_authored = prepare_metadata(session, mirror)
-                    peer_missing = metadata_complete(mirror)
-                    mirror.approval_requested_at = datetime.now(timezone.utc)
-                    if peer_missing or not peer_authored:
-                        mirror.status = PublicationStatus.awaiting_metadata
-                        session.flush()
-                        send_metadata_request(mirror, peer, video, theme_name,
-                                              peer_missing or ["caption"])
-                    else:
-                        mirror.status = PublicationStatus.awaiting_approval
-                        session.flush()
-                        send_approval_request(mirror, peer, video, theme_name)
+                    request_decision(session, mirror, peer, video, theme_name)
                     awaiting.append(mirror.id)
             else:
                 # Unattended account: queue directly, and let each peer follow
@@ -206,12 +189,7 @@ def schedule_account(session: Session, account: Account, *,
                 for mirror in peers_created:
                     peer = session.get(Account, mirror.account_id)
                     if peer.require_approval:
-                        mirror.status = PublicationStatus.awaiting_approval
-                        session.flush()
-                        prepare_metadata(session, mirror)
-                        send_approval_request(
-                            mirror, peer, video,
-                            video.theme.name if video.theme else "unknown")
+                        request_decision(session, mirror, peer, video)
                         awaiting.append(mirror.id)
                     else:
                         mirror.status = PublicationStatus.queued
@@ -252,9 +230,77 @@ def retry_failed(session: Session, *, enqueue: bool = True) -> list[int]:
     return ids
 
 
+def approval_deadline(account: Account, requested_at: datetime,
+                      cutoff_hour: int | None = None) -> datetime:
+    """The first cutoff hour, account-local, strictly after the request.
+
+    Expressed as a deadline rather than "run a cron at 23:00" on purpose: a
+    cron fires once and a container that is down at 23:00 misses it forever,
+    leaving the request stranded. A deadline is re-evaluated on every tick, so
+    a restart at 23:40 still expires it.
+    """
+    settings = get_settings()
+    cutoff_hour = settings.approval_cutoff_hour if cutoff_hour is None else cutoff_hour
+    try:
+        tzinfo = ZoneInfo(account.timezone or settings.tz)
+    except Exception:
+        tzinfo = ZoneInfo("UTC")
+    local = requested_at.astimezone(tzinfo)
+    deadline = datetime.combine(local.date(), time(cutoff_hour, 0), tzinfo=tzinfo)
+    if deadline <= local:
+        deadline += timedelta(days=1)
+    return deadline.astimezone(timezone.utc)
+
+
+def expire_stale_approvals(session: Session,
+                           now_utc: datetime | None = None) -> list[int]:
+    """Defer approval requests nobody answered before the cutoff.
+
+    Silence is not a rejection. The slot is lost, but the video goes back in
+    the pool for the next day rather than being burned by inaction.
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    expired: list[int] = []
+    waiting = session.scalars(
+        select(Publication).where(
+            Publication.status.in_([PublicationStatus.awaiting_approval,
+                                    PublicationStatus.awaiting_metadata]))
+    )
+    for publication in waiting:
+        account = session.get(Account, publication.account_id)
+        if account is None:
+            continue
+        # A row with no timestamp has no deadline to measure from; treat the
+        # moment it was scheduled as the request instead of skipping it, or it
+        # would wait forever.
+        requested = (publication.approval_requested_at
+                     or publication.scheduled_at or publication.created_at)
+        if requested is None:
+            continue
+        if requested.tzinfo is None:
+            requested = requested.replace(tzinfo=timezone.utc)
+        if now_utc < approval_deadline(account, requested):
+            continue
+
+        publication.status = PublicationStatus.deferred
+        publication.available_after = next_local_midnight(account, now_utc)
+        publication.error_message = "no answer before cutoff - deferred"
+        session.flush()
+        expired.append(publication.id)
+        video = session.get(Video, publication.video_id)
+        log.info("auto-deferred publication %s (@%s) - no answer by cutoff",
+                 publication.id, account.username)
+        send_message(
+            f"🕒 No answer for #{publication.id} "
+            f"({video.filename if video else 'video'} -> @{account.username}).\n"
+            f"Auto-deferred. Back in the pool tomorrow.")
+    return expired
+
+
 def tick() -> dict:
     """One scheduler pass across every enabled account."""
-    summary = {"schedules": 0, "accounts": 0, "queued": 0, "retried": 0}
+    summary = {"schedules": 0, "accounts": 0, "queued": 0, "retried": 0,
+               "expired": 0}
     with session_scope() as session:
         # Shared schedules first: they own their members, and a member must not
         # then be scheduled again by the per-account pass.
@@ -283,6 +329,11 @@ def tick() -> dict:
             summary["retried"] = len(retry_failed(session))
         except Exception:
             log.exception("retry sweep failed")
+        try:
+            summary["expired"] = len(expire_stale_approvals(session))
+        except Exception:
+            log.exception("approval expiry sweep failed")
+            session.rollback()
     return summary
 
 
@@ -411,19 +462,8 @@ def run_schedule(session: Session, schedule, *, now_utc: datetime | None = None,
 
                 theme_name = video.theme.name if video.theme else "unknown"
                 if member.require_approval:
-                    authored = prepare_metadata(session, publication)
-                    missing = metadata_complete(publication)
-                    publication.approval_requested_at = datetime.now(timezone.utc)
-                    if missing or not authored:
-                        publication.status = PublicationStatus.awaiting_metadata
-                        session.flush()
-                        send_metadata_request(publication, member, video,
-                                              theme_name, missing or ["caption"])
-                    else:
-                        publication.status = PublicationStatus.awaiting_approval
-                        session.flush()
-                        send_approval_request(publication, member, video,
-                                              theme_name)
+                    request_decision(session, publication, member, video,
+                                     theme_name)
                 else:
                     publication.status = PublicationStatus.queued
                     session.flush()

@@ -54,10 +54,27 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     ai_model: str = "claude-sonnet-5"
 
+    # Drive folder listing. gdown scrapes the share page and refuses folders
+    # over 50 files; the official Drive API pages through any size. A key is
+    # read-only and safe for link-shared folders, and is created in the same
+    # Google Cloud project as the YouTube client.
+    google_api_key: str | None = None
+
+    # Rows committed per batch while indexing. One commit at the end meant a
+    # crash at file 2700 of 2704 lost everything and the visible count stayed
+    # at 0 for the whole run; one commit per file would pay a network
+    # round-trip 2704 times over. Scanning is idempotent -- identity is the
+    # Drive file id -- so a partial batch is safe to keep and a re-run skips it.
+    scan_commit_batch: int = 200
+
     max_retries: int = 3
     # After this many rejected proposals the slot is abandoned for the day
     # rather than continuing to pester with more videos.
     rejection_limit: int = 5
+    # Hour (account-local) by which an approval request must be answered. An
+    # unanswered one is deferred rather than left to rot: the slot is gone, but
+    # the video returns to the pool the next day instead of being burned.
+    approval_cutoff_hour: int = 23
     scheduler_tick_seconds: int = 60
     stuck_job_minutes: int = 30
     log_level: str = "INFO"

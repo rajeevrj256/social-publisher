@@ -18,11 +18,14 @@ from .config import get_settings
 from .db import session_scope
 from .ffmpeg_utils import check_compatibility, probe
 from .media import MediaUnavailable, materialize
-from .metadata_ai import generate
+from .metadata_ai import generate, metadata_complete
 from .models import (
     Account, MetadataStatus, Publication, PublicationStatus, Video,
 )
-from .notifications import publication_message, send_message
+from .notifications import (
+    publication_message, send_approval_request, send_message,
+    send_metadata_request,
+)
 from .publishers import PublishError, RetryablePublishError, get_publisher
 
 log = logging.getLogger(__name__)
@@ -48,6 +51,35 @@ def prepare_metadata(session: Session, publication: Publication) -> bool:
     publication.hashtags = publication.hashtags or meta.hashtags
     publication.description = publication.description or meta.description
     return meta.authored
+
+
+def request_decision(session: Session, publication: Publication, account,
+                     video, theme_name: str | None = None) -> str:
+    """Ask the operator for whatever this publication still needs.
+
+    Missing wording gets the metadata form; complete wording gets the approval
+    card. Every path that puts a video in front of a human goes through here,
+    because the alternative -- each caller deciding for itself -- is what let a
+    replacement proposed after a rejection always send the approval card, so a
+    post with no caption offered no way to write one.
+
+    Returns "metadata" or "approval": which was asked for.
+    """
+    if theme_name is None:
+        theme_name = video.theme.name if video.theme else "unknown"
+    authored = prepare_metadata(session, publication)
+    missing = metadata_complete(publication)
+    publication.approval_requested_at = datetime.now(timezone.utc)
+    if missing or not authored:
+        publication.status = PublicationStatus.awaiting_metadata
+        session.flush()
+        send_metadata_request(publication, account, video, theme_name,
+                              missing or ["caption"])
+        return "metadata"
+    publication.status = PublicationStatus.awaiting_approval
+    session.flush()
+    send_approval_request(publication, account, video, theme_name)
+    return "approval"
 
 
 def publish_publication(publication_id: int) -> str:
@@ -252,10 +284,19 @@ def index_source(source_id: int) -> dict:
                          default_theme_id=theme.id if theme else None)
 
         log.info("indexed source %s: %s", source.name, stats)
-        send_message(
-            f"📥 Indexed {source.name}\n\n"
-            f"Theme: {theme.name if theme else 'unassigned'}\n"
-            f"Added: {stats.get('added', 0)}\n"
-            f"Already known: {stats.get('skipped', 0) + stats.get('updated', 0)}\n"
-            f"Total seen: {stats.get('seen', 0)}")
+        error = stats.get("error")
+        if error:
+            # A failed listing used to report "Added: 0" like an empty folder,
+            # so a broken ingest was indistinguishable from a finished one.
+            send_message(
+                f"⚠️ Could not index {source.name}\n\n"
+                f"Theme: {theme.name if theme else 'unassigned'}\n"
+                f"Folder: {source.location}\n\n{error}")
+        else:
+            send_message(
+                f"📥 Indexed {source.name}\n\n"
+                f"Theme: {theme.name if theme else 'unassigned'}\n"
+                f"Added: {stats.get('added', 0)}\n"
+                f"Already known: {stats.get('skipped', 0) + stats.get('updated', 0)}\n"
+                f"Total seen: {stats.get('seen', 0)}")
         return stats

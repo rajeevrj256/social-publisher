@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
 from pathlib import Path
 
 from sqlalchemy import select
@@ -56,6 +57,87 @@ def func_lower(column):
     return func.lower(column)
 
 
+DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+class DriveListingError(RuntimeError):
+    """Listing failed for a reason retrying will not fix."""
+
+
+def drive_folder_id(location: str) -> str | None:
+    """The folder id out of any of the share-link shapes Drive hands out."""
+    import re
+
+    for pattern in (r"/folders/([A-Za-z0-9_-]+)",
+                    r"[?&]id=([A-Za-z0-9_-]+)"):
+        match = re.search(pattern, location)
+        if match:
+            return match.group(1)
+    return None
+
+
+def list_drive_files_api(folder_id: str, api_key: str,
+                         _depth: int = 0) -> list[dict]:
+    """Every file under a link-shared folder, via the official Drive API.
+
+    gdown reads the share page and gives up over 50 files, which silently
+    truncated large folders. files.list pages instead, so folder size stops
+    mattering. Subfolders are walked because operators organise by batch.
+    """
+    import requests
+
+    if _depth > 6:                      # a cycle would otherwise never end
+        return []
+    out: list[dict] = []
+    token = None
+    while True:
+        params = {
+            "q": f"'{folder_id}' in parents and trashed = false",
+            "key": api_key,
+            "fields": "nextPageToken, files(id, name, mimeType)",
+            "pageSize": 1000,
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+        }
+        if token:
+            params["pageToken"] = token
+        # A folder of a few thousand files spans many pages, and one dropped
+        # connection would otherwise abandon the whole listing (seen live:
+        # IncompleteRead on the first page, fine on retry).
+        payload = None
+        for attempt in range(4):
+            try:
+                response = requests.get(
+                    "https://www.googleapis.com/drive/v3/files",
+                    params=params, timeout=60)
+                if response.status_code in (429, 500, 502, 503, 504):
+                    raise RuntimeError(f"Drive API {response.status_code}")
+                if response.status_code != 200:
+                    # 400/403 are our fault (bad key, API not enabled, folder
+                    # not shared); retrying cannot help.
+                    raise DriveListingError(
+                        f"Drive API {response.status_code}: "
+                        f"{response.text[:300]}")
+                payload = response.json()
+                break
+            except DriveListingError:
+                raise
+            except Exception as exc:
+                if attempt == 3:
+                    raise DriveListingError(
+                        f"Drive listing failed after 4 attempts: {exc}") from exc
+                time.sleep(2 ** attempt)
+        for item in payload.get("files", []):
+            if item.get("mimeType") == DRIVE_FOLDER_MIME:
+                out += list_drive_files_api(item["id"], api_key, _depth + 1)
+            else:
+                out.append(item)
+        token = payload.get("nextPageToken")
+        if not token:
+            break
+    return out
+
+
 def scan_gdrive_source(session: Session, source: Source, theme: Theme | None,
                        ) -> dict:
     """Index a shared Drive folder without downloading anything.
@@ -64,26 +146,58 @@ def scan_gdrive_source(session: Session, source: Source, theme: Theme | None,
     time. Duration and dimensions are therefore unknown until then, so these
     rows stay `pending` and are validated after the just-in-time download.
     """
-    import gdown
-
     stats = {"seen": 0, "added": 0, "updated": 0, "skipped": 0, "invalid": 0,
-             "duplicates": 0}
-    try:
-        listing = gdown.download_folder(url=source.location, skip_download=True,
-                                        quiet=True, use_cookies=False)
-    except Exception as exc:
-        log.error("could not list Drive folder for source %s: %s",
-                  source.name, exc)
-        return stats
-    if not listing:
-        log.warning("Drive folder for source %s is empty or not shared",
-                    source.name)
-        return stats
+             "duplicates": 0, "error": None}
 
-    for item in listing:
-        # gdown returns objects carrying the file id and its local-relative path.
-        file_id = getattr(item, "id", None) or getattr(item, "file_id", None)
-        name = Path(getattr(item, "local_path", "") or getattr(item, "path", "")).name
+    api_key = get_settings().google_api_key
+    folder_id = drive_folder_id(source.location)
+    entries: list[tuple[str, str]] = []          # (file id, filename)
+
+    if api_key and folder_id:
+        try:
+            entries = [(f["id"], f.get("name") or "")
+                       for f in list_drive_files_api(folder_id, api_key)]
+        except Exception as exc:
+            log.error("Drive API listing failed for source %s: %s",
+                      source.name, exc)
+            stats["error"] = f"Drive API listing failed: {exc}"
+            return stats
+    else:
+        import gdown
+
+        try:
+            listing = gdown.download_folder(url=source.location,
+                                            skip_download=True, quiet=True,
+                                            use_cookies=False)
+        except Exception as exc:
+            # gdown refuses folders over 50 files. Returning empty stats here
+            # made /ingest look successful while indexing nothing, so the
+            # reason is carried back instead of only logged.
+            hint = ""
+            if "MaximumLimit" in type(exc).__name__ or "50 files" in str(exc):
+                hint = (" - this folder holds more than the 50 files gdown can "
+                        "list. Set GOOGLE_API_KEY to use the Drive API, which "
+                        "has no such limit.")
+            log.error("could not list Drive folder for source %s: %s%s",
+                      source.name, exc, hint)
+            stats["error"] = f"{exc}{hint}"
+            return stats
+        if not listing:
+            log.warning("Drive folder for source %s is empty or not shared",
+                        source.name)
+            stats["error"] = ("Drive returned no files: the folder is empty, or "
+                              "not shared as 'Anyone with the link'.")
+            return stats
+        entries = [
+            (getattr(i, "id", None) or getattr(i, "file_id", None),
+             Path(getattr(i, "local_path", "") or getattr(i, "path", "")).name)
+            for i in listing
+        ]
+
+    batch = max(1, get_settings().scan_commit_batch)
+    pending = 0
+
+    for file_id, name in entries:
         if not file_id or not name:
             continue
         if not name.lower().endswith(VIDEO_SUFFIXES_TUPLE):
@@ -116,7 +230,19 @@ def scan_gdrive_source(session: Session, source: Source, theme: Theme | None,
                 video.remote_url, changed = expected_url, True
             stats["updated" if changed else "skipped"] += 1
 
-    session.flush()
+        pending += 1
+        if pending >= batch:
+            # Durable progress. Committing per file would pay a round trip to
+            # Neon thousands of times; committing only at the end threw the
+            # whole scan away on any interruption and left the row count at 0
+            # until the very last moment, which is indistinguishable from a
+            # scan that is failing.
+            session.commit()
+            pending = 0
+            log.info("indexed %s: %s/%s files so far", source.name,
+                     stats["seen"], len(entries))
+
+    session.commit()
     log.info("indexed Drive source %s: %s", source.name, stats)
     return stats
 
@@ -189,6 +315,9 @@ def scan(session: Session, root: str | None = None, *,
     if not root_path.exists():
         log.warning("video root %s does not exist", root_path)
         return stats
+
+    batch = max(1, settings.scan_commit_batch)
+    pending = 0
 
     # filepath is always stored relative to VIDEO_ROOT, never to the source
     # folder: the worker, the publishers and the Telegram preview all resolve it
@@ -287,6 +416,14 @@ def scan(session: Session, root: str | None = None, *,
                 changed = True
             stats["updated" if changed else "skipped"] += 1
 
-    session.flush()
+        pending += 1
+        if pending >= batch:
+            # Same reasoning as the Drive scan: a local walk also probes every
+            # file with ffprobe, so an interrupted run is expensive to redo.
+            session.commit()
+            pending = 0
+            log.info("scanned %s files so far", stats["seen"])
+
+    session.commit()
     log.info("scan complete: %s", stats)
     return stats
