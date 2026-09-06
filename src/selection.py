@@ -47,6 +47,30 @@ def pick_theme(themes: list[AccountTheme], rng: random.Random | None = None
     return (rng or random).choices(themes, weights=weights, k=1)[0]
 
 
+def expired_deferral():
+    """A "not today" whose day has passed, and so no longer blocks its video.
+
+    Defined once and shared by every place that asks "does a publication row
+    block this video?". When candidate_video_query knew about expired
+    deferrals and video_is_eligible_for did not, the scheduler picked a revived
+    video every tick and then refused it -- logging
+    "skipping @acct for 012.mp4: already has publication #24" once a minute
+    forever while the slot stayed empty.
+    """
+    return and_(Publication.status == PublicationStatus.deferred,
+                Publication.available_after.isnot(None),
+                Publication.available_after <= func.now())
+
+
+def blocking_publication(session: Session, account: Account, video_id: int):
+    """The publication row that stops this account posting this video, if any."""
+    return session.scalar(
+        select(Publication).where(Publication.video_id == video_id,
+                                  Publication.account_id == account.id,
+                                  Publication.platform == account.platform,
+                                  ~expired_deferral()))
+
+
 def candidate_video_query(account: Account, theme_id: int | None):
     """Videos this account may still post.
 
@@ -70,9 +94,7 @@ def candidate_video_query(account: Account, theme_id: int | None):
         .where(Publication.video_id == Video.id,
                Publication.account_id == account.id,
                Publication.platform == account.platform,
-               ~and_(Publication.status == PublicationStatus.deferred,
-                     Publication.available_after.isnot(None),
-                     Publication.available_after <= func.now()))
+               ~expired_deferral())
         .correlate(Video)
     )
 
@@ -338,10 +360,7 @@ def video_is_eligible_for(session: Session, account: Account, video: Video
     Used by the coordinated fan-out, where the video is already chosen and the
     question is only whether each peer may take it.
     """
-    existing = session.scalar(
-        select(Publication).where(Publication.video_id == video.id,
-                                  Publication.account_id == account.id,
-                                  Publication.platform == account.platform))
+    existing = blocking_publication(session, account, video.id)
     if existing is not None:
         return False, f"already has publication #{existing.id}"
 

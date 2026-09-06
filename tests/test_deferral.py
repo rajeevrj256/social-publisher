@@ -196,9 +196,13 @@ def test_unanswered_approval_is_deferred_after_cutoff(session, setup, monkeypatc
 
     assert expired == [pub.id]
     assert pub.status == PublicationStatus.deferred
-    assert pub.available_after is not None
-    assert videos[0].id not in candidates(session, account), \
-        "still blocked until the deferral expires"
+    # Asserted against the injected clock, not the wall clock: candidacy is
+    # evaluated by the database's own now(), so comparing the two made this
+    # test flip the moment the real date moved past the fixed timestamps.
+    assert pub.available_after > datetime(2026, 9, 5, 18, 0, tzinfo=timezone.utc)
+    assert pub.available_after == datetime(2026, 9, 5, 18, 30,
+                                           tzinfo=timezone.utc), \
+        "deferred until the next IST midnight"
 
 
 def test_approval_is_left_alone_before_cutoff(session, setup, monkeypatch):
@@ -431,3 +435,54 @@ def test_decide_reject_is_still_permanent(session, setup, monkeypatch):
 
     assert pub.status == PublicationStatus.rejected
     assert pub.available_after is None
+
+
+# ---- the three call sites must agree ----------------------------------------
+
+def test_selection_and_eligibility_agree_on_expired_deferrals(session, setup):
+    """The live infinite loop: picked every tick, then refused every tick.
+
+    candidate_video_query stopped excluding an expired deferral while
+    video_is_eligible_for still did, so run_schedule chose the video, rejected
+    it, filled no slot, and logged
+    "skipping @acct for 012.mp4: already has publication #24" once a minute
+    with the operator receiving nothing at all.
+    """
+    from src.selection import video_is_eligible_for
+
+    account, _, videos = setup
+    pub = reserve_publication(session, account, videos[0])
+    pub.status = PublicationStatus.deferred
+    pub.available_after = datetime.now(timezone.utc) - timedelta(minutes=1)
+    session.flush()
+
+    assert videos[0].id in candidates(session, account), "selection offers it"
+    ok, reason = video_is_eligible_for(session, account, videos[0])
+    assert ok, f"but eligibility refused it: {reason}"
+
+
+def test_a_live_deferral_is_refused_by_both(session, setup):
+    from src.selection import video_is_eligible_for
+
+    account, _, videos = setup
+    pub = reserve_publication(session, account, videos[0])
+    pub.status = PublicationStatus.deferred
+    pub.available_after = datetime.now(timezone.utc) + timedelta(hours=6)
+    session.flush()
+
+    assert videos[0].id not in candidates(session, account)
+    ok, _ = video_is_eligible_for(session, account, videos[0])
+    assert not ok, "a deferral still in force must block both paths"
+
+
+def test_a_rejection_is_refused_by_both(session, setup):
+    from src.selection import video_is_eligible_for
+
+    account, _, videos = setup
+    pub = reserve_publication(session, account, videos[0])
+    pub.status = PublicationStatus.rejected
+    session.flush()
+
+    assert videos[0].id not in candidates(session, account)
+    ok, _ = video_is_eligible_for(session, account, videos[0])
+    assert not ok, "a permanent rejection must block both paths"
