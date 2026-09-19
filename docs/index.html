@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aesthetic Finds Publisher</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#5a5a5a; --bg:#fbfbfa; --line:#e5e3df; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e6e3; --muted:#a0a0a0; --bg:#17171a; --line:#2e2e33; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:44rem; margin:0 auto; padding:4rem 1.25rem; }
+  h1 { font-size:2rem; margin:0 0 .5rem; letter-spacing:-.02em; }
+  .sub { color:var(--muted); margin:0 0 2.5rem; }
+  h2 { font-size:1.1rem; margin:2.5rem 0 .75rem; }
+  ul { padding-left:1.25rem; } li { margin:.4rem 0; }
+  footer { margin-top:3.5rem; padding-top:1.5rem; border-top:1px solid var(--line);
+           color:var(--muted); font-size:.9rem; }
+  a { color:inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Aesthetic Finds Publisher</h1>
+  <p class="sub">A private tool that publishes my own short-form videos to my own YouTube channel on a schedule.</p>
+
+  <h2>What it does</h2>
+  <ul>
+    <li>Reads short videos from my own media library.</li>
+    <li>Proposes each one to me for approval, with a title and description, over a private Telegram chat.</li>
+    <li>Uploads only what I personally approve to my own YouTube channel, at a scheduled time.</li>
+  </ul>
+
+  <h2>Who it is for</h2>
+  <p>Me. It is a single-operator tool for my own channel and is not offered as a service to anyone else.</p>
+
+  <h2>YouTube access</h2>
+  <p>It uses the YouTube Data API v3 to upload videos to the channel that authorised it. It does not read, modify or delete any other content.</p>
+
+  <footer>
+    <a href="privacy.html">Privacy policy</a>
+  </footer>
+</main>
+</body>
+</html>

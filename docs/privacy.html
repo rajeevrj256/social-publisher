@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Privacy Policy — Aesthetic Finds Publisher</title>
+<style>
+  :root { --fg:#1a1a1a; --muted:#5a5a5a; --bg:#fbfbfa; --line:#e5e3df; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8e6e3; --muted:#a0a0a0; --bg:#17171a; --line:#2e2e33; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:44rem; margin:0 auto; padding:4rem 1.25rem; }
+  h1 { font-size:1.85rem; margin:0 0 .4rem; letter-spacing:-.02em; }
+  .sub { color:var(--muted); margin:0 0 2.5rem; font-size:.95rem; }
+  h2 { font-size:1.05rem; margin:2.25rem 0 .6rem; }
+  ul { padding-left:1.25rem; } li { margin:.4rem 0; }
+  footer { margin-top:3.5rem; padding-top:1.5rem; border-top:1px solid var(--line);
+           color:var(--muted); font-size:.9rem; }
+  a { color:inherit; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Privacy Policy</h1>
+  <p class="sub">Aesthetic Finds Publisher · last updated 19 September 2026</p>
+
+  <p>Aesthetic Finds Publisher ("the app") is a private, single-operator tool used by its owner to upload their own videos to their own YouTube channel. It has no other users and offers no service to the public.</p>
+
+  <h2>Information the app accesses</h2>
+  <ul>
+    <li><strong>YouTube authorisation.</strong> When the owner authorises the app, Google issues it an access token and a refresh token for the owner's own YouTube channel.</li>
+    <li><strong>Channel identifier.</strong> The app reads the id and title of the authorising channel so it knows where to upload.</li>
+    <li><strong>Video files and their titles, descriptions and tags</strong>, supplied by the owner.</li>
+  </ul>
+  <p>The app does not access viewer data, analytics, comments, subscriber information, or any other person's account.</p>
+
+  <h2>How the information is used</h2>
+  <p>Solely to upload the owner's videos to the owner's channel via the YouTube Data API v3. The app performs no other operation on the account.</p>
+
+  <h2>Storage and security</h2>
+  <ul>
+    <li>OAuth tokens are encrypted at rest and stored in a private database that only the owner can reach.</li>
+    <li>Tokens are never written to logs, never displayed, and never shared.</li>
+    <li>Video files are processed on the owner's own machine.</li>
+  </ul>
+
+  <h2>Sharing</h2>
+  <p>Nothing is sold, rented, or shared with any third party. Data is transmitted only to Google's own APIs in order to perform the upload the owner requested.</p>
+
+  <h2>Retention and deletion</h2>
+  <p>Tokens are kept only while the app is in use and are deleted when access is revoked. The owner can revoke the app's access at any time at <a href="https://myaccount.google.com/connections">myaccount.google.com/connections</a>, which immediately invalidates its tokens.</p>
+
+  <h2>Google API Services User Data Policy</h2>
+  <p>The app's use and transfer of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including the Limited Use requirements.</p>
+
+  <h2>Contact</h2>
+  <p>Questions about this policy can be sent to the support email listed on the app's Google consent screen.</p>
+
+  <footer><a href="index.html">Back to home</a></footer>
+</main>
+</body>
+</html>
