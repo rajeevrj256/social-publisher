@@ -19,6 +19,7 @@ import httpx
 
 from ..config import get_settings
 from ..crypto import decrypt
+from ..storage import StorageError, delete as storage_delete, is_configured, upload
 from ..models import Account, Publication, Video
 from .base import PublishError, PublishResult, RetryablePublishError
 
@@ -80,6 +81,20 @@ class InstagramPublisher:
                 "or give the account a remote_url source.")
         return f"{base}/{quote(video.filepath)}"
 
+    def stage_media(self, video: Video, file_path: str,
+                    source=None) -> tuple[str, str | None]:
+        """Return (public_url, cleanup_key) for the bytes Meta will fetch.
+
+        A configured bucket wins: it makes the URL independent of how the
+        library is stored, which is what lets Drive-sourced videos publish at
+        all. Without one the historic PUBLIC_MEDIA_BASE_URL path is used
+        unchanged, so existing deployments are unaffected.
+        """
+        if is_configured():
+            url, key = upload(file_path, video.filename)
+            return url, key
+        return self.public_url_for(video, source), None
+
     def remaining_quota(self, account: Account, token: str) -> int | None:  # noqa: D401
         """Meta exposes the account's own usage; checking beats discovering the
         limit through a failed publish."""
@@ -120,12 +135,30 @@ class InstagramPublisher:
                              [publication.caption, publication.hashtags] if part)
 
         base = self.api_base(account)
+        source = video.source if video.source_id else None
+        try:
+            video_url, cleanup_key = self.stage_media(video, file_path, source)
+        except StorageError as exc:
+            # A bucket outage is worth another attempt; the video is untouched.
+            raise RetryablePublishError(str(exc)) from exc
+
+        try:
+            return self._publish_from_url(account, publication, base, token,
+                                          video_url, caption)
+        finally:
+            # Runs on success and failure alike: Meta has its own copy once
+            # published, and a failed attempt must not leave the file exposed.
+            if cleanup_key:
+                storage_delete(cleanup_key)
+
+    def _publish_from_url(self, account: Account, publication: Publication,
+                          base: str, token: str, video_url: str,
+                          caption: str) -> PublishResult:
         with self._http() as client:
-            source = video.source if video.source_id else None
             container = client.post(
                 f"{base}/{account.platform_account_id}/media",
                 data={"media_type": "REELS",
-                      "video_url": self.public_url_for(video, source),
+                      "video_url": video_url,
                       "caption": caption or "",
                       "access_token": token},
             )

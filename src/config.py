@@ -31,6 +31,20 @@ class Settings(BaseSettings):
     video_root: str = "/videos/to_publish"
     public_media_base_url: str = ""
 
+    # Temporary public hosting for platforms that fetch by URL (Instagram).
+    # Any S3-compatible store: Cloudflare R2, Backblaze B2, S3, MinIO.
+    # Left blank, the publisher falls back to PUBLIC_MEDIA_BASE_URL and
+    # behaviour is exactly as before.
+    media_bucket: str = ""
+    media_s3_endpoint: str = ""
+    media_s3_access_key: str = ""
+    media_s3_secret_key: str = ""
+    media_s3_region: str = ""
+    # The bucket's public hostname. Not derivable from the endpoint: R2 uses
+    # a separate r2.dev domain, B2 a f00x.backblazeb2.com one.
+    media_public_base_url: str = ""
+    media_key_prefix: str = "publish"
+
     meta_app_id: str = ""
     meta_app_secret: str = ""
     meta_graph_version: str = "v25.0"
